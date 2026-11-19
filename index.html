@@ -60,9 +60,10 @@
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 // =====================================================================
-// صفحة متابعة العربيات — نسخة 1.0 (المرحلة ٢)
-// فيها ٣ أوضاع حسب اللينك:
-//   #k=المفتاح      ← صفحة السواق: بتبعت مكان العربية لـ Firebase
+// صفحة متابعة العربيات — نسخة 1.1
+// فيها ٤ أوضاع حسب اللينك:
+//   #k=المفتاح      ← صفحة السواق: بتبعت مكان العربية لـ Firebase (ولصفحة الركاب متشفّر)
+//   #g=المفتاح      ← صفحة الركاب (لينك جروب الخط): الراكب بيكتب رقمه أول مرة، ويشوف العربية فين وعند مين
 //   #view=المفتاح   ← صفحة متابعة تجريبية: بتعرض العربية على الخريطة لحظة بلحظة
 //   من غير حاجة     ← وضع التجربة: بيعمل مفتاح جديد ويديك اللينكين
 // المفتاح بيتكتب بعد # في اللينك، وده معناه إنه مش بيتبعت لأي سيرفر غير Firebase نفسه
@@ -91,6 +92,48 @@ async function fb(method, k, path, body, keepalive) {
   return r.json();
 }
 const SV = { '.sv': 'timestamp' }; // وقت السيرفر
+// ---------- 🔐 تشفير بيانات الركاب (WebCrypto — جوه المتصفح نفسه) ----------
+// كل خط ليه مفتاح تشفير K. الأسماء ومكان العربية بيتبعتوا لـ Firebase متشفّرين بـ K.
+// K نفسه متخزّن مقفول بكل رقم موبايل مسموح (ركاب الخط + السواق): من غير رقم منهم مفيش فك تشفير.
+const b64 = buf => { const u = new Uint8Array(buf); let s = ''; for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]); return btoa(s); };
+const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+const hexOf = u => Array.from(u, x => x.toString(16).padStart(2, '0')).join('');
+// رقم مصري بأي شكل (٠١٠..، +20..، 0020..) ← 2010xxxxxxxx
+function phNorm(raw) {
+  let d = String(raw || '').replace(/[٠-٩]/g, c => c.charCodeAt(0) - 0x660).replace(/[۰-۹]/g, c => c.charCodeAt(0) - 0x6F0).replace(/[^0-9]/g, '');
+  if (d.startsWith('00')) d = d.slice(2);
+  if (d.startsWith('0') && d.length === 11) d = '20' + d.slice(1);
+  else if (d.length === 10 && d.startsWith('1')) d = '20' + d;
+  return d;
+}
+// من الرقم بنطلّع: id (علشان نلاقي مكانه) + مفتاح يفتح K. بطيئة عن قصد (150 ألف مرة) علشان محدش يجرّب كل الأرقام
+async function phDerive(phone, pk) {
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(phone), 'PBKDF2', false, ['deriveBits']);
+  const bits = new Uint8Array(await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: new TextEncoder().encode('bus:' + pk), iterations: 150000 }, base, 384));
+  return { id: hexOf(bits.slice(0, 16)), wk: await crypto.subtle.importKey('raw', bits.slice(16), 'AES-GCM', false, ['encrypt', 'decrypt']) };
+}
+const aesKey = rawB64 => crypto.subtle.importKey('raw', unb64(rawB64), 'AES-GCM', false, ['encrypt', 'decrypt']);
+async function encRaw(key, bytes) { const iv = crypto.getRandomValues(new Uint8Array(12)), ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, bytes)), o = new Uint8Array(12 + ct.length); o.set(iv); o.set(ct, 12); return b64(o); }
+async function decRaw(key, s) { const u = unb64(s); return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: u.slice(0, 12) }, key, u.slice(12))); }
+const encJ = (key, obj) => encRaw(key, new TextEncoder().encode(JSON.stringify(obj)));
+const decJ = async (key, s) => JSON.parse(new TextDecoder().decode(await decRaw(key, s)));
+// ---------- 🔑 دخول مخفي (Anonymous) — علشان Firebase يسمح بالكتابة في مكان الركاب ----------
+const FB_KEY = 'AIzaSyASkCIg-NAB7r0Mmitfrp5yIQQ3w-78tbE';
+async function fbAuth(lsKey) {
+  let a = null; try { a = JSON.parse(localStorage.getItem(lsKey)); } catch (e) {}
+  const keep = j => { try { localStorage.setItem(lsKey, JSON.stringify(j)); } catch (e) {} return j; };
+  if (a && a.tok && a.exp - 300000 > Date.now()) return a;
+  if (a && a.rt) {
+    try {
+      const r = await fetch('https://securetoken.googleapis.com/v1/token?key=' + FB_KEY, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'grant_type=refresh_token&refresh_token=' + encodeURIComponent(a.rt) });
+      if (r.ok) { const j = await r.json(); return keep({ uid: j.user_id, tok: j.id_token, rt: j.refresh_token, exp: Date.now() + (+j.expires_in) * 1000 }); }
+    } catch (e) {}
+  }
+  const r = await fetch('https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=' + FB_KEY, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ returnSecureToken: true }) });
+  if (!r.ok) throw new Error('auth ' + r.status);
+  const j = await r.json(); return keep({ uid: j.localId, tok: j.idToken, rt: j.refreshToken, exp: Date.now() + (+j.expiresIn) * 1000 });
+}
+
 
 // مفتاح عشوائي ٣٢ حرف (مستحيل يتخمّن)
 function newKey() {
@@ -138,6 +181,49 @@ function driverMode(k) {
   let plan = null, done = {}, running = false, watchId = null, lastFix = null, lastFixAt = 0, lastSent = null, lastSentAt = 0, lastOkAt = 0;
   let wake = null, swReg = null, staleWarnAt = 0, routeFor = null, routeAt = 0, follow = true, battery = null;
   let queue = ls.get(Q_KEY, []);
+  // 👥 صفحة الركاب: بنبعتلها مكان العربية + مين عليه الدور + الوقت المتوقع لكل راكب (متشفّر)
+  let pubKey = null, pubKeyFor = null, pubAuth = null, eta = {}, etaAt = 0, etaCalcAt = 0, lastPlanAt = 0, pubBusy = false;
+  async function pubPrep() {
+    if (!plan || !plan.pub || !plan.pk2) return false;
+    if (pubKeyFor !== plan.pk2) { pubKey = await aesKey(plan.pk2); pubKeyFor = plan.pk2; }
+    pubAuth = await fbAuth('trk_auth');
+    const flag = 'trk_wr_' + plan.pub + '_' + pubAuth.uid;
+    if (!ls.get(flag, false)) {
+      // بنسجّل نفسنا كاتب للخط ده (Firebase بيتأكد إن معانا مفتاح السواق)
+      const r = await fetch(`${DB}/wr/${plan.pub}/${pubAuth.uid}.json?auth=${pubAuth.tok}`, { method: 'PUT', body: JSON.stringify(k) });
+      if (!r.ok) throw new Error('wr ' + r.status);
+      ls.set(flag, true);
+    }
+    return true;
+  }
+  async function pubSend(st, keepalive) {
+    if (!lastFix || !plan || !plan.pub || pubBusy) return;
+    pubBusy = true;
+    try {
+      if (!(await pubPrep())) return;
+      const ci = nextIdx(), stops = plan.stops || [];
+      const obj = { lat: +lastFix.lat.toFixed(5), lng: +lastFix.lng.toFixed(5), st: st || 'on', spd: lastFix.spd != null ? +lastFix.spd.toFixed(1) : null,
+        cur: ci, at: ci >= 0 && distM(lastFix, stops[ci]) < 120, done: Object.keys(done).map(Number), eta, etaAt, t: Date.now() };
+      const body = JSON.stringify({ enc: await encJ(pubKey, obj), srv: SV });
+      await fetch(`${DB}/pub/${plan.pub}/live.json?auth=${pubAuth.tok}`, { method: 'PUT', body, keepalive: !!keepalive });
+    } catch (e) { /* مش مشكلة — هنحاول تاني مع التحديث الجاي */ }
+    finally { pubBusy = false; }
+  }
+  // الوقت المتوقع لكل راكب لسه ماركبش (بالطرق الحقيقية + دقيقة وقوف عند كل واحد)
+  async function calcEta() {
+    if (!lastFix || !plan || !plan.stops || !plan.stops.length) return;
+    etaCalcAt = Date.now();
+    const rem = plan.stops.map((s, i) => i).filter(i => !done[i]);
+    if (!rem.length) { eta = {}; etaAt = Date.now(); return; }
+    const pts = [lastFix].concat(rem.map(i => plan.stops[i]));
+    try {
+      const r = await fetch(`https://router.project-osrm.org/route/v1/driving/${pts.map(p => p.lng + ',' + p.lat).join(';')}?overview=false`);
+      const j = await r.json(), legs = j.routes && j.routes[0] && j.routes[0].legs; if (!legs) return;
+      let t = 0; const e = {};
+      rem.forEach((i, n) => { t += legs[n].duration; e[i] = Math.round(t); t += 60; });
+      eta = e; etaAt = Date.now();
+    } catch (e) {}
+  }
 
   app.innerHTML = `
     <div class="banner err" id="bErr"></div>
@@ -155,7 +241,7 @@ function driverMode(k) {
       <div class="muted" style="margin-top:6px">⚠️ خلّي الصفحة دي مفتوحة طول الرحلة والموبايل على الشاحن. لو كلّمت حد أو فتحت أبلكيشن تاني، ارجع للصفحة دي على طول.</div>
     </div>
     <button class="btn big err hide" id="bEnd">⏹️ خلصت الرحلة</button>
-    <div class="muted" style="text-align:center">متابعة العربية — نسخة 1.0</div>`;
+    <div class="muted" style="text-align:center">متابعة العربية — نسخة 1.1</div>`;
 
   const map = makeMap($('map'));
   const stopLayer = L.layerGroup().addTo(map), routeLayer = L.layerGroup().addTo(map);
@@ -168,6 +254,7 @@ function driverMode(k) {
 
   // ----- بيانات الخط (صفحتك هي اللي هتبعتها في المرحلة ٣) -----
   async function loadPlan() {
+    lastPlanAt = Date.now();
     try {
       const d = await fb('GET', k, '');
       plan = d && d.plan || null; done = d && d.done || {};
@@ -236,6 +323,7 @@ function driverMode(k) {
     if (done[i]) { delete done[i]; fb('DELETE', k, 'done/' + i).catch(() => {}); }
     else { done[i] = Date.now(); fb('PUT', k, 'done/' + i, SV).catch(() => {}); try { navigator.vibrate && navigator.vibrate(80); } catch (e) {} }
     ls.set('trk_plan_' + k, { plan, done }); routeFor = null; drawPlan();
+    etaCalcAt = 0; await calcEta(); pubSend('on');
   });
 
   // ----- إرسال المكان -----
@@ -255,10 +343,13 @@ function driverMode(k) {
       queue = []; ls.set(Q_KEY, queue); lastOkAt = Date.now();
     } catch (e) { /* النت قاطع: النقط فاضلة في الطابور وهتتبعت بعدين */ }
     sending = false; drawStats();
+    pubSend(st, keepalive);
   }
   function tick() {
     if (!running) return;
     const now = Date.now();
+    if (lastFix && now - etaCalcAt > 60000) calcEta();
+    if ((!plan || !plan.pub) && now - lastPlanAt > 120000) loadPlan(); // لو برنامج المشرف بعت بيانات الخط بعد ما فتحنا
     // GPS واقف؟
     if (lastFixAt && now - lastFixAt > GPS_STALE && document.visibilityState === 'visible') {
       showB('bErr', `🔴 الـ GPS ما بعتش مكان من ${fmtAge(now - lastFixAt)} — اتأكد إن الموقع (Location) مفتوح في الموبايل.`);
@@ -397,7 +488,7 @@ function viewMode(k) {
     <div id="vmap"></div>
     <div class="card"><div class="stats" id="vStats"></div></div>
     <div class="row"><button class="btn grow" id="vFit">🔍 وريني العربية</button><button class="btn grow" id="vTrail">🧵 خط السير: ظاهر</button></div>
-    <div class="muted" style="text-align:center">صفحة متابعة تجريبية — نسخة 1.0</div>`;
+    <div class="muted" style="text-align:center">صفحة متابعة تجريبية — نسخة 1.1</div>`;
   const map = makeMap($('vmap'));
   const trailL = L.polyline([], { color: '#ffd400', weight: 4, opacity: .9 }).addTo(map);
   let busMk = null, data = {}, fitted = false, showTrail = true, lastAlert = 0;
@@ -489,10 +580,136 @@ function testMode() {
   app.addEventListener('click', ev => { const b = ev.target.closest('[data-copy]'); if (!b) return; navigator.clipboard.writeText(b.dataset.copy).then(() => { b.textContent = 'اتنسخ ✓'; }, () => {}); });
 }
 
+// =====================================================================
+// صفحة الركاب (#g=المفتاح) — لينك جروب الخط
+// أول مرة: الراكب بيكتب رقمه. لو الرقم من أرقام ركاب الخط أو السواق، الصفحة بتفتح المفتاح وتفتكره.
+// الصفحة بتعرض: العربية فين (على الخريطة)، عند مين دلوقتي، والوقت المتوقع لكل اسم — من غير أي بيانات تانية
+// =====================================================================
+function riderMode(pk) {
+  const KEEP = 'trk_g_' + pk;
+  app.innerHTML = '<div class="card"><div class="muted">⏳ بحمّل...</div></div>';
+  fetch(`${DB}/pub/${pk}/meta.json`).then(r => r.json()).then(meta => {
+    if (!meta || !meta.keys) { app.innerHTML = '<div class="card"><b>⏳ الخط ده لسه مش جاهز</b><div class="muted">جرّب تاني بعد شوية.</div></div>'; return; }
+    const saved = ls.get(KEEP, null);
+    if (saved && saved.k) riderMain(pk, meta, saved); else riderGate(pk, meta);
+  }).catch(() => { app.innerHTML = '<div class="card"><b>📵 مفيش نت</b><div class="muted">اتأكد من النت وافتح اللينك تاني.</div></div>'; });
+}
+function riderGate(pk, meta) {
+  app.innerHTML = `
+    <div class="card">
+      <div style="font-size:18px;font-weight:800">🚐 متابعة عربية الشغل</div>
+      <div class="muted">اكتب رقم موبايلك علشان تفتح المتابعة. ده مرة واحدة بس — الموبايل هيفتكرك.</div>
+      <input id="gPh" type="tel" inputmode="tel" placeholder="01xxxxxxxxx" style="width:100%;font-size:20px;padding:12px;margin-top:10px;border:1px solid var(--line);border-radius:10px;direction:ltr;text-align:center">
+      <button class="btn big pri" id="gGo" style="margin-top:10px">🔓 افتح</button>
+      <div class="banner err" id="gErr" style="margin-top:8px"></div>
+    </div>`;
+  const go = async () => {
+    const ph = phNorm($('gPh').value), b = $('gGo'), err = $('gErr');
+    err.classList.remove('show');
+    if (ph.length < 11) { err.textContent = '⚠️ اكتب الرقم كامل.'; err.classList.add('show'); return; }
+    b.disabled = true; b.textContent = '⏳ بتأكد من الرقم...';
+    try {
+      const d = await phDerive(ph, pk), ent = meta.keys[d.id];
+      if (!ent) { await new Promise(r => setTimeout(r, 1500)); throw new Error('no'); }
+      const raw = await decRaw(d.wk, ent.w);
+      const saved = { k: b64(raw), n: ent.n };
+      ls.set('trk_g_' + pk, saved);
+      try { AC = AC || new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+      riderMain(pk, meta, saved);
+    } catch (e) {
+      if (e && e.message !== 'no') console.warn('unlock', e);
+      err.innerHTML = '🔴 الرقم ده مش من أرقام ركاب الخط ده.<br>اكتب الرقم اللي مسجّل عند المشرف.'; err.classList.add('show');
+      b.disabled = false; b.textContent = '🔓 افتح';
+    }
+  };
+  $('gGo').onclick = go;
+  $('gPh').onkeydown = e => { if (e.key === 'Enter') go(); };
+}
+async function riderMain(pk, meta, saved) {
+  let K, info;
+  try { K = await aesKey(saved.k); info = await decJ(K, meta.enc); }
+  catch (e) { ls.del('trk_g_' + pk); riderGate(pk, meta); return; } // الخط اتغيّر — يكتب رقمه تاني
+  const me = saved.n, names = info.names || [], pm = info.mode === 'pm';
+  $('htitle').textContent = '🚐 ' + (info.line || 'متابعة العربية');
+  app.innerHTML = `
+    <div class="banner err" id="rAlert"></div>
+    <div class="card" id="rMe" style="border:2px solid ${esc(info.color || '#0f6fd8')}"></div>
+    <div class="card"><div style="font-size:19px;font-weight:800" id="rNow">⏳ بتوصل...</div><div class="muted" id="rSub"></div></div>
+    <div id="vmap"></div>
+    <div class="card"><b>${pm ? 'الترتيب (النزول)' : 'الترتيب (الركوب)'}</b><div id="rList"></div></div>
+    <div class="row"><button class="btn grow" id="rBell">🔔 نبّهني لما العربية تقرب</button><button class="btn grow" id="rFit">🔍 وريني العربية</button></div>
+    <div class="muted" style="text-align:center">مواعيد تقريبية — متابعة العربية نسخة 1.1 · <a href="#" id="rOut">مش رقمي؟</a></div>`;
+  const map = makeMap($('vmap'));
+  let busMk = null, live = null, liveSrv = 0, fitted = false, alerted = false, bell = false;
+  $('rBell').onclick = () => { bell = true; try { AC = AC || new (window.AudioContext || window.webkitAudioContext)(); AC.resume && AC.resume(); } catch (e) {} $('rBell').textContent = '🔔 هنبّهك ✓'; };
+  $('rFit').onclick = () => { if (live) map.setView([live.lat, live.lng], 16); };
+  $('rOut').onclick = e => { e.preventDefault(); ls.del('trk_g_' + pk); location.reload(); };
+  const first = n => String(n || '').trim().split(/\s+/)[0];
+  const etaLeft = i => { if (!live || !live.eta || live.eta[i] == null) return null; return Math.max(0, live.eta[i] - (Date.now() - (live.etaAt || live.t)) / 1000); };
+  const minsTxt = s => s == null ? '' : s < 90 ? 'أقل من دقيقتين' : 'حوالي ' + Math.round(s / 60) + ' د';
+  function draw() {
+    const now = Date.now(), age = liveSrv ? now - liveSrv : Infinity;
+    const doneSet = new Set(live && live.done || []);
+    const st = !live ? 'none' : live.st === 'off' ? 'off' : (live.st === 'pause' || age > 60000) ? 'stale' : 'on';
+    // الحالة دلوقتي
+    let now1 = '', sub = '';
+    if (st === 'none') { now1 = '⏳ العربية لسه ما بدأتش الرحلة'; sub = 'أول ما السواق يبدأ، هتظهر هنا على طول.'; }
+    else if (st === 'off') { now1 = '✅ الرحلة خلصت'; }
+    else {
+      const c = live.cur;
+      now1 = c >= 0 ? (live.at ? `📍 العربية دلوقتي عند: ${esc(first(names[c]))}` : `🚐 في الطريق لـ: ${esc(first(names[c]))}`) : (pm ? '✅ وصّلت الكل' : '🏢 كله ركب — في الطريق للشغل');
+      sub = st === 'stale' ? (live.st === 'pause' ? `⏸️ المتابعة متوقفة مؤقتًا من ${fmtAge(age)} (غالبًا السواق في مكالمة) — اللي على الخريطة آخر مكان معروف.` : `⚠️ آخر تحديث من ${fmtAge(age)} — ممكن النت قاطع عند السواق.`) : `🟢 آخر تحديث من ${fmtAge(age)}`;
+    }
+    $('rNow').innerHTML = now1; $('rSub').innerHTML = sub;
+    $('hdot').style.background = st === 'on' ? '#2ecc71' : st === 'stale' ? '#f39c12' : '#888';
+    // أنا
+    if (me >= 0 && names[me] != null) {
+      let t;
+      if (doneSet.has(me)) t = pm ? '✅ نزلت' : '✅ ركبت';
+      else if (st === 'off') t = '—';
+      else if (st === 'none') t = '⏳ لسه ما اتحركتش';
+      else if (live.cur === me && live.at) t = '📍 العربية عندك دلوقتي!';
+      else { const s = etaLeft(me); t = live.cur === me ? `🚐 إنت اللي عليك الدور — ${minsTxt(s)}` : `⏳ ${minsTxt(s)}`;
+        if (bell && !alerted && s != null && s <= 300 && st === 'on') { alerted = true; beep(4); $('rAlert').innerHTML = '🔔 العربية قربت منك — اجهز!'; $('rAlert').classList.add('show'); } }
+      const before = names.filter((n, i) => i < me && !doneSet.has(i)).length;
+      $('rMe').innerHTML = `<div class="muted">إنت: <b>${esc(first(names[me]))}</b> — رقم ${me + 1} في الترتيب${!doneSet.has(me) && before ? ` · فاضل قبلك ${before}` : ''}</div><div style="font-size:20px;font-weight:800;margin-top:4px">${t}</div>`;
+    } else $('rMe').innerHTML = `<div class="muted">🧑‍✈️ إنت مسجّل كسواق الخط.</div>`;
+    // القايمة
+    $('rList').innerHTML = names.map((n, i) => {
+      const d = doneSet.has(i), cur = live && live.cur === i && st !== 'off';
+      const t = d ? (pm ? '✅ نزل' : '✅ ركب') : cur ? (live.at ? '📍 العربية عنده' : '🚐 الجاي ' + minsTxt(etaLeft(i))) : (st === 'on' || st === 'stale') ? '⏳ ' + minsTxt(etaLeft(i)) : '';
+      return `<div class="stop${d ? ' done' : ''}${cur ? ' cur' : ''}"><span class="n">${i + 1}</span><span class="nm">${esc(first(n))}${i === me ? ' <small style="color:var(--pri)">(إنت)</small>' : ''}</span><span class="muted">${t}</span></div>`;
+    }).join('');
+    // الخريطة: العربية بس (من غير أي علامات عند البيوت)
+    if (live && st !== 'off') {
+      const ll = [live.lat, live.lng];
+      if (!busMk) busMk = L.marker(ll, { icon: busIcon(st !== 'on'), zIndexOffset: 1000 }).addTo(map); else { busMk.setLatLng(ll); busMk.setIcon(busIcon(st !== 'on')); }
+      if (!fitted) { fitted = true; map.setView(ll, 15); }
+    } else if (busMk) { map.removeLayer(busMk); busMk = null; }
+  }
+  // تحديثات لحظية من Firebase
+  const es = new EventSource(`${DB}/pub/${pk}.json`);
+  let raw = {};
+  const onLive = async () => {
+    const L1 = raw.live; if (!L1 || !L1.enc) { live = null; liveSrv = 0; draw(); return; }
+    try { live = await decJ(K, L1.enc); liveSrv = typeof L1.srv === 'number' ? L1.srv : (live.t || 0); } catch (e) {}
+    draw();
+  };
+  const on = ev => { try { const d = JSON.parse(ev.data), path = d.path.replace(/\/$/, '');
+    const set = (pth, val) => { const parts = pth.split('/').filter(Boolean); if (!parts.length) { raw = val || {}; return; } let o = raw; for (let i = 0; i < parts.length - 1; i++) { if (typeof o[parts[i]] !== 'object' || !o[parts[i]]) o[parts[i]] = {}; o = o[parts[i]]; } if (val === null) delete o[parts[parts.length - 1]]; else o[parts[parts.length - 1]] = val; };
+    if (ev.type === 'put') set(path, d.data); else Object.keys(d.data || {}).forEach(c => set(path + '/' + c, d.data[c]));
+    if (path === '' || path.startsWith('/meta')) { if (raw.meta && raw.meta.enc && raw.meta.enc !== meta.enc) { location.reload(); return; } } // المشرف غيّر بيانات الخط
+    onLive(); } catch (e) {} };
+  es.addEventListener('put', on); es.addEventListener('patch', on);
+  es.onerror = () => { $('rSub').textContent = '📵 الاتصال اتقطع — بحاول تاني...'; };
+  draw(); setInterval(draw, 1000);
+}
+
 // ---------- أنهي وضع؟ ----------
 function route() {
-  const k = hashArg('k'), v = hashArg('view');
+  const k = hashArg('k'), v = hashArg('view'), g = hashArg('g');
   if (k && k.length >= 24) driverMode(k);
+  else if (g && g.length >= 24) riderMode(g);
   else if (v && v.length >= 24) viewMode(v);
   else testMode();
 }
