@@ -51,6 +51,14 @@
   .dlg{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:3000;padding:16px}
   .dlg .card{max-width:420px;width:100%}
   .hide{display:none!important}
+  /* السرعة وحالة التتبع فوق الخريطة */
+  .mapw{position:relative}
+  .hud{position:absolute;top:10px;right:10px;z-index:1000;pointer-events:none;display:flex;flex-direction:column;gap:6px;align-items:flex-end}
+  .hud .sp{background:rgba(15,42,68,.9);color:#fff;border-radius:12px;padding:6px 12px;text-align:center;min-width:86px;box-shadow:0 1px 6px rgba(0,0,0,.45);line-height:1.1}
+  .hud .sp b{display:block;font-size:30px;font-weight:800;direction:ltr}
+  .hud .sp small{font-size:12px;font-weight:700;opacity:.85}
+  .hud .tk{border-radius:10px;padding:5px 10px;font-size:13px;font-weight:800;color:#fff;box-shadow:0 1px 6px rgba(0,0,0,.4)}
+  .hud .tk.ok{background:var(--ok)} .hud .tk.warn{background:var(--warn)} .hud .tk.err{background:var(--err)} .hud .tk.idle{background:#5d6d7e}
 </style>
 </head>
 <body>
@@ -234,14 +242,14 @@ function driverMode(k) {
     </div>
     <button class="btn big pri" id="bStart">▶️ ابدأ الرحلة</button>
     <div class="card next hide" id="cNext"></div>
-    <div id="map"></div>
+    <div class="mapw"><div id="map"></div><div class="hud hide" id="hud"></div></div>
     <div class="card hide" id="cStops"><b>الركاب</b><div id="stops"></div></div>
     <div class="card hide" id="cStat">
       <div class="stats" id="stats"></div>
       <div class="muted" style="margin-top:6px">⚠️ خلّي الصفحة دي مفتوحة طول الرحلة والموبايل على الشاحن. لو كلّمت حد أو فتحت أبلكيشن تاني، ارجع للصفحة دي على طول.</div>
     </div>
     <button class="btn big err hide" id="bEnd">⏹️ خلصت الرحلة</button>
-    <div class="muted" style="text-align:center">متابعة العربية — نسخة 1.1</div>`;
+    <div class="muted" style="text-align:center">متابعة العربية — نسخة 1.2</div>`;
 
   const map = makeMap($('map'));
   const stopLayer = L.layerGroup().addTo(map), routeLayer = L.layerGroup().addTo(map);
@@ -366,7 +374,25 @@ function driverMode(k) {
     }
     drawStats();
   }
+  // السرعة وحالة التتبع فوق الخريطة (نفس بيانات الكارت اللي تحت)
+  function drawHud() {
+    const h = $('hud'); if (!h) return;
+    if (!running) { h.classList.add('hide'); return; }
+    h.classList.remove('hide');
+    const now = Date.now(), f = lastFix;
+    const net = navigator.onLine && lastOkAt && now - lastOkAt < 40000;
+    const stale = !!(f && lastFixAt && now - lastFixAt > GPS_STALE);
+    let cls, txt;
+    if (!f) { cls = 'idle'; txt = '🛰️ بدوّر على الـ GPS...'; }
+    else if (stale) { cls = 'err'; txt = '🔴 الـ GPS واقف من ' + fmtAge(now - lastFixAt); }
+    else if (!navigator.onLine) { cls = 'warn'; txt = '📵 مفيش نت — بيتحفظ'; }
+    else if (!net) { cls = 'warn'; txt = '🟡 بيحاول يبعت...'; }
+    else { cls = 'ok'; txt = '🟢 التتبع شغال'; }
+    const v = f && !stale && f.spd != null ? Math.round(f.spd * 3.6) : null;
+    h.innerHTML = `<div class="sp"><b>${v != null ? v : '—'}</b><small>كم/س</small></div><div class="tk ${cls}">${txt}</div>`;
+  }
   function drawStats() {
+    drawHud();
     if (!running) return;
     const now = Date.now(), f = lastFix;
     const net = navigator.onLine && lastOkAt && now - lastOkAt < 40000;
@@ -448,7 +474,7 @@ function driverMode(k) {
     if (!(await confirmDlg('خلصت الرحلة؟', 'المتابعة هتقف وصفحة المتابعة هتعرف إن الرحلة خلصت.', '⏹️ أيوه خلصت'))) return;
     if (lastFix) await flush('off');
     else { try { await fb('PATCH', k, 'pos', { st: 'off', srv: SV }); } catch (e) {} }
-    running = false; ls.del(RUN_KEY);
+    running = false; ls.del(RUN_KEY); drawHud();
     if (watchId != null) navigator.geolocation.clearWatch(watchId); watchId = null;
     try { wake && wake.release(); } catch (e) {} wake = null;
     $('bStart').classList.remove('hide'); $('bEnd').classList.add('hide'); $('cStat').classList.add('hide'); $('cNext').classList.add('hide');
