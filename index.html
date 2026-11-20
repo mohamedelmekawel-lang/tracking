@@ -6,6 +6,7 @@
 <meta name="theme-color" content="#0f2a44">
 <title>🚐 متابعة العربية</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
 <style>
   :root{--bg:#f3f5f8;--card:#fff;--ink:#1c2733;--muted:#6b7785;--line:#dfe4ea;--pri:#0f6fd8;--ok:#1e8449;--warn:#b9770e;--err:#c0392b;--nav:#0f2a44}
   *{box-sizing:border-box}
@@ -59,6 +60,17 @@
   .hud .sp small{font-size:12px;font-weight:700;opacity:.85}
   .hud .tk{border-radius:10px;padding:5px 10px;font-size:13px;font-weight:800;color:#fff;box-shadow:0 1px 6px rgba(0,0,0,.4)}
   .hud .tk.ok{background:var(--ok)} .hud .tk.warn{background:var(--warn)} .hud .tk.err{background:var(--err)} .hud .tk.idle{background:#5d6d7e}
+  /* خريطة السواق: الخريطة أكبر، وكارت الراكب الجاي فوقها من تحت */
+  .mapw #map{height:68vh;min-height:420px}
+  .mapw .next{position:absolute;left:10px;right:10px;bottom:34px;z-index:1000;border:0;border-radius:16px;box-shadow:0 2px 14px rgba(0,0,0,.35);padding:10px 12px}
+  .mapw .next h3{font-size:12px;margin:0 0 2px}
+  .mapw .next .nm{font-size:20px}
+  .mapw .next .row{margin-top:6px;flex-wrap:nowrap}
+  .mapw .next .btn{padding:10px 8px;font-size:15px}
+  .mapbtn{position:absolute;right:10px;top:122px;z-index:1000;width:46px;height:46px;border-radius:50%;border:0;background:#fff;box-shadow:0 1px 8px rgba(0,0,0,.4);font-size:22px;cursor:pointer}
+  .pin.mp.cur{width:36px;height:36px;font-size:16px;border-width:3px;box-shadow:0 0 0 5px rgba(26,115,232,.35)}
+  .plab{position:absolute;bottom:44px;left:50%;transform:translateX(-50%);white-space:nowrap;background:#fff;color:var(--ink);border-radius:8px;padding:3px 8px;font-size:13px;font-weight:800;box-shadow:0 1px 6px rgba(0,0,0,.4)}
+  .busarrow{width:44px;height:44px;filter:drop-shadow(0 1px 4px rgba(0,0,0,.5))}
 </style>
 </head>
 <body>
@@ -66,9 +78,10 @@
 <div class="wrap" id="app"></div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
 <script>
 // =====================================================================
-// صفحة متابعة العربيات — نسخة 1.1
+// صفحة متابعة العربيات — نسخة 1.3
 // فيها ٤ أوضاع حسب اللينك:
 //   #k=المفتاح      ← صفحة السواق: بتبعت مكان العربية لـ Firebase (ولصفحة الركاب متشفّر)
 //   #g=المفتاح      ← صفحة الركاب (لينك جروب الخط): الراكب بيكتب رقمه أول مرة، ويشوف العربية فين وعند مين
@@ -166,6 +179,113 @@ function makeMap(el) {
 const busIcon = faded => L.divIcon({ html: `<div class="bus${faded ? ' faded' : ''}">🚐</div>`, className: '', iconSize: [34, 34], iconAnchor: [17, 17] });
 const numIcon = (n, col) => L.divIcon({ html: `<div class="pin" style="background:${col}">${n}</div>`, className: '', iconSize: [28, 28], iconAnchor: [14, 14] });
 
+// ---------- 🗺️ خريطة السواق: شكل حديث (MapLibre + OpenFreeMap) ورجوع تلقائي لـ Leaflet لو مفيش WebGL أو المكتبة ما اتحمّلتش ----------
+const MAP_STYLE = 'https://tiles.openfreemap.org/styles/bright';
+const gNavUrl = s => `https://www.google.com/maps/dir/?api=1&destination=${s.lat},${s.lng}&travelmode=driving`;
+function makeDriverMap(el, cb) {
+  const st = { stops: [], done: {}, cur: -1, col: '#0f6fd8', work: null, fit: false, route: null, bus: null };
+  let eng = null, timer = null;
+  const EMPTY = { type: 'FeatureCollection', features: [] };
+  const pinEl = (n, col, isDone, label) => {
+    const d = document.createElement('div'); d.className = 'pin mp' + (label ? ' cur' : '');
+    d.style.background = isDone ? '#9aa5b1' : col; d.textContent = n;
+    if (label) { const t = document.createElement('span'); t.className = 'plab'; t.textContent = label; d.appendChild(t); }
+    return d;
+  };
+  const arrowEl = () => {
+    const d = document.createElement('div'); d.className = 'busarrow'; d.style.zIndex = 10;
+    d.innerHTML = '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="11" fill="rgba(26,115,232,.25)"/><path d="M12 3 L19 20 L12 16 L5 20 Z" fill="#1a73e8" stroke="#fff" stroke-width="1.8" stroke-linejoin="round"/></svg>';
+    return d;
+  };
+  function mlEngine() {
+    try { maplibregl.setRTLTextPlugin('https://unpkg.com/@mapbox/mapbox-gl-rtl-text@0.2.3/mapbox-gl-rtl-text.min.js', true); } catch (e) {} // علشان الأسماء العربي تتكتب متصلة
+    const m = new maplibregl.Map({ container: el, style: MAP_STYLE, center: [31.2357, 30.0444], zoom: 11, attributionControl: false, maxPitch: 70 });
+    m.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-right');
+    m.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-left');
+    ['dragstart', 'rotatestart', 'pitchstart'].forEach(ev => m.on(ev, () => cb.moved()));
+    const E = { kind: 'ml', ready: false, mk: [], busMk: null };
+    E.stops = () => {
+      E.mk.forEach(x => x.remove()); E.mk = [];
+      const b = new maplibregl.LngLatBounds(); let n = 0;
+      st.stops.forEach((s, i) => {
+        E.mk.push(new maplibregl.Marker({ element: pinEl(i + 1, st.col, !!st.done[i], i === st.cur ? s.n : ''), anchor: 'center' }).setLngLat([s.lng, s.lat]).addTo(m));
+        b.extend([s.lng, s.lat]); n++;
+      });
+      if (st.work) {
+        const w = document.createElement('div'); w.style.fontSize = '26px'; w.textContent = '🏢';
+        E.mk.push(new maplibregl.Marker({ element: w, anchor: 'center' }).setLngLat([st.work.lng, st.work.lat]).addTo(m));
+        b.extend([st.work.lng, st.work.lat]); n++;
+      }
+      if (n && st.fit && !st.bus) m.fitBounds(b, { padding: 50, maxZoom: 15, duration: 0 });
+    };
+    E.route = () => {
+      if (!E.ready) return;
+      m.getSource('route').setData(st.route ? { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: st.route } } : EMPTY);
+    };
+    E.bus = () => {
+      const b = st.bus; if (!b) return;
+      if (!E.busMk) E.busMk = new maplibregl.Marker({ element: arrowEl(), anchor: 'center', rotationAlignment: 'map', pitchAlignment: 'map' }).setLngLat([b.lng, b.lat]).addTo(m);
+      else E.busMk.setLngLat([b.lng, b.lat]);
+      if (b.hdg != null) E.busMk.setRotation(b.hdg);
+    };
+    E.cam = first => {
+      const b = st.bus; if (!b) return;
+      const mv = b.spd != null && b.spd > 2 && b.hdg != null; // ماشي: الخريطة تلف مع اتجاه العربية
+      if (first) { m.jumpTo({ center: [b.lng, b.lat], zoom: 16.5, pitch: 45, bearing: mv ? b.hdg : 0 }); return; }
+      m.easeTo({ center: [b.lng, b.lat], bearing: mv ? b.hdg : m.getBearing(), pitch: 45, duration: 900, essential: true });
+    };
+    E.destroy = () => { try { m.remove(); } catch (e) {} };
+    m.on('load', () => {
+      clearTimeout(timer);
+      m.addSource('route', { type: 'geojson', data: EMPTY });
+      m.addLayer({ id: 'route-casing', type: 'line', source: 'route', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': '#ffffff', 'line-width': 11, 'line-opacity': 0.95 } });
+      m.addLayer({ id: 'route-line', type: 'line', source: 'route', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': '#1a73e8', 'line-width': 7 } });
+      E.ready = true; E.route();
+    });
+    return E;
+  }
+  function lfEngine() {
+    const map = makeMap(el), stopL = L.layerGroup().addTo(map), routeL = L.layerGroup().addTo(map);
+    let busMk = null;
+    map.on('dragstart', () => cb.moved());
+    return {
+      kind: 'lf', ready: true,
+      stops() {
+        stopL.clearLayers(); const b = [];
+        st.stops.forEach((s, i) => { L.marker([s.lat, s.lng], { icon: numIcon(i + 1, st.done[i] ? '#9aa5b1' : st.col) }).bindTooltip(esc(s.n)).addTo(stopL); b.push([s.lat, s.lng]); });
+        if (st.work) { L.marker([st.work.lat, st.work.lng], { icon: L.divIcon({ html: '<div style="font-size:26px">🏢</div>', className: '', iconSize: [30, 30], iconAnchor: [15, 15] }) }).bindTooltip('الشغل').addTo(stopL); b.push([st.work.lat, st.work.lng]); }
+        if (b.length && st.fit && !st.bus) map.fitBounds(b, { padding: [30, 30], maxZoom: 15 });
+      },
+      route() { routeL.clearLayers(); if (st.route) L.polyline(st.route.map(c => [c[1], c[0]]), { color: '#00b4ff', weight: 6, opacity: .9 }).addTo(routeL); },
+      bus() { const b = st.bus; if (!b) return; const ll = [b.lat, b.lng]; if (!busMk) busMk = L.marker(ll, { icon: busIcon(false), zIndexOffset: 1000 }).addTo(map); else busMk.setLatLng(ll); },
+      cam(first) { const b = st.bus; if (!b) return; if (first) map.setView([b.lat, b.lng], 16); else map.panTo([b.lat, b.lng], { animate: true }); },
+      destroy() { try { map.remove(); } catch (e) {} },
+    };
+  }
+  const nullEngine = () => ({ kind: 'none', ready: true, stops() {}, route() {}, bus() {}, cam() {}, destroy() {} });
+  function degrade() {
+    if (!eng || eng.kind !== 'ml') return;
+    eng.destroy(); el.className = ''; el.innerHTML = '';
+    eng = typeof L !== 'undefined' ? lfEngine() : nullEngine();
+    eng.stops(); eng.route(); eng.bus();
+  }
+  try {
+    if (window.maplibregl) { eng = mlEngine(); timer = setTimeout(() => { if (eng && eng.kind === 'ml' && !eng.ready) degrade(); }, 12000); }
+  } catch (e) { eng = null; }
+  if (!eng) eng = typeof L !== 'undefined' ? lfEngine() : nullEngine();
+  return {
+    kind: () => eng.kind,
+    stops(o) { Object.assign(st, o); eng.stops(); },
+    route(coords) { st.route = coords && coords.length ? coords : null; eng.route(); },
+    bus(lat, lng, hdg, spd, follow) {
+      const first = !st.bus;
+      st.bus = { lat, lng, hdg: Number.isFinite(hdg) ? hdg : (st.bus ? st.bus.hdg : null), spd: Number.isFinite(spd) ? spd : null };
+      eng.bus(); if (follow || first && follow !== false) eng.cam(first);
+    },
+    recenter() { if (st.bus) eng.cam(false); },
+  };
+}
+
 // ---------- صوت تنبيه واهتزاز ----------
 let AC = null;
 function beep(times) {
@@ -241,20 +361,19 @@ function driverMode(k) {
       <div class="muted" id="lineSub"></div>
     </div>
     <button class="btn big pri" id="bStart">▶️ ابدأ الرحلة</button>
-    <div class="card next hide" id="cNext"></div>
-    <div class="mapw"><div id="map"></div><div class="hud hide" id="hud"></div></div>
+    <div class="mapw"><div id="map"></div><div class="hud hide" id="hud"></div>
+      <button class="mapbtn hide" id="bCenter" title="رجّع الخريطة على العربية">🎯</button>
+      <div class="card next hide" id="cNext"></div></div>
     <div class="card hide" id="cStops"><b>الركاب</b><div id="stops"></div></div>
     <div class="card hide" id="cStat">
       <div class="stats" id="stats"></div>
       <div class="muted" style="margin-top:6px">⚠️ خلّي الصفحة دي مفتوحة طول الرحلة والموبايل على الشاحن. لو كلّمت حد أو فتحت أبلكيشن تاني، ارجع للصفحة دي على طول.</div>
     </div>
     <button class="btn big err hide" id="bEnd">⏹️ خلصت الرحلة</button>
-    <div class="muted" style="text-align:center">متابعة العربية — نسخة 1.2</div>`;
+    <div class="muted" style="text-align:center">متابعة العربية — نسخة 1.3</div>`;
 
-  const map = makeMap($('map'));
-  const stopLayer = L.layerGroup().addTo(map), routeLayer = L.layerGroup().addTo(map);
-  let busMk = null;
-  map.on('dragstart', () => { follow = false; });
+  const DM = makeDriverMap($('map'), { moved: () => { follow = false; $('bCenter').classList.remove('hide'); } });
+  $('bCenter').onclick = () => { follow = true; $('bCenter').classList.add('hide'); DM.recenter(); };
 
   const isPm = () => plan && plan.mode === 'pm';
   const nextIdx = () => plan && plan.stops ? plan.stops.findIndex((s, i) => !done[i]) : -1;
@@ -282,11 +401,8 @@ function driverMode(k) {
       $('lineName').textContent = '🚐 متابعة العربية';
       $('lineSub').textContent = 'لسه مفيش ركاب متبعتين للخط ده — تقدر تبدأ الرحلة والمتابعة هتشتغل عادي.';
     }
-    stopLayer.clearLayers();
-    const stops = plan && plan.stops || [], col = plan && plan.color || '#0f6fd8', b = [];
-    stops.forEach((s, i) => { L.marker([s.lat, s.lng], { icon: numIcon(i + 1, done[i] ? '#9aa5b1' : col) }).bindTooltip(esc(s.n)).addTo(stopLayer); b.push([s.lat, s.lng]); });
-    if (plan && plan.work) { L.marker([plan.work.lat, plan.work.lng], { icon: L.divIcon({ html: '<div style="font-size:26px">🏢</div>', className: '', iconSize: [30, 30], iconAnchor: [15, 15] }) }).bindTooltip('الشغل').addTo(stopLayer); b.push([plan.work.lat, plan.work.lng]); }
-    if (b.length && !lastFix) map.fitBounds(b, { padding: [30, 30], maxZoom: 15 });
+    const stops = plan && plan.stops || [], col = plan && plan.color || '#0f6fd8';
+    DM.stops({ stops, done, cur: nextIdx(), col, work: plan && plan.work || null, fit: !lastFix });
     $('cStops').classList.toggle('hide', !stops.length);
     $('stops').innerHTML = stops.map((s, i) => `<div class="stop${done[i] ? ' done' : ''}${i === nextIdx() ? ' cur' : ''}">
         <span class="n">${i + 1}</span><span class="nm">${esc(s.n)}</span>
@@ -304,6 +420,7 @@ function driverMode(k) {
       <div class="nm">${esc(s.n)}</div>
       <div class="muted" id="nextInfo">${d != null ? `على بعد ${d < 1000 ? Math.round(d) + ' متر' : (d / 1000).toFixed(1) + ' كم'} (خط مستقيم)` : ''}</div>
       <div class="row" style="margin-top:8px">${s.ph ? `<a class="btn pri grow" href="tel:${esc(s.ph)}" style="text-align:center;text-decoration:none">📞 كلّمه</a>` : ''}
+      <a class="btn grow" href="${gNavUrl(s)}" target="_blank" rel="noopener" style="text-align:center;text-decoration:none;background:#1a73e8;color:#fff">🧭 ملاحة</a>
       <button class="btn ok grow" data-done="${i}">${isPm() ? 'نزل ✓' : 'ركب ✓'}</button></div>`;
     drawRoute();
   }
@@ -311,15 +428,14 @@ function driverMode(k) {
   async function drawRoute(force) {
     const i = nextIdx();
     const target = !plan ? null : i >= 0 ? plan.stops[i] : (!isPm() && plan.work ? plan.work : null);
-    if (!lastFix || !target) { routeLayer.clearLayers(); return; }
+    if (!lastFix || !target) { DM.route(null); return; }
     const key = i + '';
     if (!force && routeFor === key && Date.now() - routeAt < 90000) return;
     routeFor = key; routeAt = Date.now();
     try {
       const r = await fetch(`https://router.project-osrm.org/route/v1/driving/${lastFix.lng},${lastFix.lat};${target.lng},${target.lat}?overview=full&geometries=geojson`);
       const j = await r.json(); const rt = j.routes && j.routes[0]; if (!rt) return;
-      routeLayer.clearLayers();
-      L.polyline(rt.geometry.coordinates.map(c => [c[1], c[0]]), { color: '#00b4ff', weight: 6, opacity: .9 }).addTo(routeLayer);
+      DM.route(rt.geometry.coordinates);
       const ni = $('nextInfo'); if (ni) ni.textContent = `الطريق: ${(rt.distance / 1000).toFixed(1)} كم · حوالي ${Math.max(1, Math.round(rt.duration / 60))} د`;
     } catch (e) {}
   }
@@ -415,10 +531,7 @@ function driverMode(k) {
     lastFix = { lat: c.latitude, lng: c.longitude, acc: c.accuracy, spd: c.speed, hdg: c.heading, t: p.timestamp || Date.now() };
     lastFixAt = Date.now();
     if ($('bErr').classList.contains('show') && /GPS|الموقع/.test($('bErr').textContent)) showB('bErr', '');
-    const ll = [lastFix.lat, lastFix.lng];
-    if (!busMk) { busMk = L.marker(ll, { icon: busIcon(false), zIndexOffset: 1000 }).addTo(map); map.setView(ll, 16); }
-    else busMk.setLatLng(ll);
-    if (follow) map.panTo(ll, { animate: true });
+    DM.bus(lastFix.lat, lastFix.lng, lastFix.hdg, lastFix.spd, follow);
     drawNext();
     tick();
   }
